@@ -1,0 +1,491 @@
+---
+title: "**Breast Cancer Classification Problem Analysis**"
+author: "Talisha Govender"
+date: "`r Sys.Date()`"
+output: pdf_document
+classoption: fleqn
+fontsize: 12pt
+header-includes:
+- \usepackage{amsmath,verbatim,url,bm,hyperref,amsthm,amssymb,graphicx,fancyhdr,fullpage,lastpage,titling,lipsum}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, eval=TRUE, warning=TRUE, message=FALSE, prompt=TRUE, strip.white=TRUE, cache=FALSE, size='tiny', comment='', fig.width=12, fig.height=7, dev='pdf', options(width = 70))
+```
+
+
+
+## Importing Data
+
+```{r}
+library(mlbench)   #Package which has dataset- BreastCancer
+library(caTools)   #Package has split function which is used to split our dataset into training and test data.
+library(caret)     #Package has functions for training and plotting models
+library(mice)      #Package has function to remove NA value in dataset
+library(e1071)     #Package has function to implement naiveBayes classification algorithm
+library(rpart)     #Package has function to implement tree algorithm
+library(randomForest) #Package has function to implement Random Forest Algorithm
+data("BreastCancer") #Loads dataset
+```
+
+```{r}
+
+library(tidyverse)
+library(pROC)
+library(pls)
+library(HMM)
+library(entropy)
+library(xgboost)
+library(arm)
+library(kernlab)
+library(glmnet)
+```
+
+```{r}
+bc <- BreastCancer
+
+
+
+library(dplyr) # Add this at the top if not already loaded
+
+# Remove Id column if it exists
+if ("Id" %in% colnames(bc)) {
+  bc <- dplyr::select(bc, -Id)
+}
+
+bc <- bc %>% filter(complete.cases(.))
+
+# Convert factors to numeric (1:9 are features)
+bc[, 1:9] <- lapply(bc[, 1:9], function(x) as.numeric(as.character(x)))
+bc$Class <- factor(bc$Class, levels = c("benign", "malignant"))
+
+```
+
+```{r}
+
+# Split into training/testing sets
+set.seed(123)
+trainIndex <- createDataPartition(bc$Class, p = 0.7, list = FALSE)
+trainData <- bc[trainIndex, ]
+testData <- bc[-trainIndex, ]
+
+x_train <- trainData[, -ncol(trainData)]
+y_train <- trainData$Class
+x_test <- testData[, -ncol(testData)]
+y_test <- testData$Class
+
+
+```
+
+```{r}
+# Full dataset counts
+full_counts <- table(bc$Class)
+
+# Training set counts
+train_counts <- table(y_train)
+
+# Test set counts
+test_counts <- table(y_test)
+
+# Combine into a data frame
+descriptive_stats <- data.frame(
+  Set = c("Full dataset", "Training set", "Test set"),
+  Benign = c(full_counts["benign"], train_counts["benign"], test_counts["benign"]),
+  Malignant = c(full_counts["malignant"], train_counts["malignant"], test_counts["malignant"]),
+  Total = c(sum(full_counts), sum(train_counts), sum(test_counts))
+)
+
+descriptive_stats
+
+```
+
+
+```{r}
+# Preprocessing: center and scale
+pre_proc <- preProcess(x_train, method = c("center", "scale"))
+x_train_scaled <- predict(pre_proc, x_train)
+x_test_scaled <- predict(pre_proc, x_test)
+
+train_final <- cbind(x_train_scaled, Class = y_train)
+test_final <- cbind(x_test_scaled, Class = y_test)
+
+```
+
+
+
+```{r}
+# Training control
+ctrl <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+# Model training function
+train_model <- function(method, data, ...) {
+  train(Class ~ ., data = data, method = method,
+        trControl = ctrl, metric = "ROC", ...)
+}
+```
+
+```{r}
+
+models <- list(
+  "Logistic" = train_model("glmnet", train_final,
+                           family = "binomial",
+                           tuneGrid = expand.grid(alpha = 0,
+                                                  lambda = 10^seq(-4, 0, length.out = 20))),
+  "Random Forest" = train_model("rf", train_final, ntree = 500, tuneLength = 5),
+  "K-NN" = train_model("knn", train_final, preProcess = c("center", "scale"),
+                       tuneGrid = expand.grid(k = 1:10)),
+  "SVM" = train_model("svmRadial", train_final, tuneLength = 5, probability = TRUE),
+  "Bayesian GLM" = train_model("bayesglm", train_final)
+)
+
+# XGBoost (manual setup)
+xgb_train <- xgb.DMatrix(
+  data = as.matrix(x_train_scaled),
+  label = ifelse(y_train == "malignant", 1, 0)
+)
+
+xgb_model <- xgb.cv(
+  params = list(objective = "binary:logistic", eval_metric = "logloss",
+                max_depth = 3, eta = 0.1, gamma = 0,
+                colsample_bytree = 0.8, min_child_weight = 1, subsample = 0.8),
+  data = xgb_train,
+  nrounds = 100,
+  nfold = 5,
+  early_stopping_rounds = 10,
+  verbose = 0
+)
+
+xgb_final <- xgb.train(params = xgb_model$params, data = xgb_train,
+                       nrounds = xgb_model$best_iteration, verbose = 0)
+```
+
+
+```{r}
+
+# Evaluation function
+evaluate_model <- function(model, test_data, is_xgb = FALSE) {
+  if (is_xgb) {
+    prob <- predict(model, as.matrix(test_data[, -ncol(test_data)]))
+    pred <- factor(ifelse(prob > 0.5, "malignant", "benign"), levels = c("benign", "malignant"))
+  } else {
+    pred <- predict(model, test_data)
+    prob <- predict(model, test_data, type = "prob")[, "malignant"]
+  }
+
+  cm <- confusionMatrix(pred, test_data$Class, positive = "malignant")
+  auc_val <- roc(test_data$Class, prob)$auc
+
+  list(
+    Accuracy = round(cm$overall["Accuracy"], 3),
+    Sensitivity = round(cm$byClass["Sensitivity"], 3),
+    Specificity = round(cm$byClass["Specificity"], 3),
+    F1_Score = round(2 * (cm$byClass["Pos Pred Value"] * cm$byClass["Sensitivity"]) /
+                     (cm$byClass["Pos Pred Value"] + cm$byClass["Sensitivity"]), 3),
+    AUC = round(auc_val, 3),
+    ROC = roc(test_data$Class, prob)
+  )
+}
+
+# Collect results
+results <- map_dfr(names(models), ~ {
+  res <- evaluate_model(models[[.]], test_final)
+  tibble(Model = ., !!!res[-6])
+})
+
+xgb_res <- evaluate_model(xgb_final, test_final, is_xgb = TRUE)
+results <- bind_rows(results, tibble(Model = "XGBoost", !!!xgb_res[-6]))
+
+# Print sorted results
+cat("\n ==== Classification Results ==== \n")
+results %>% arrange(desc(AUC)) %>% print()
+
+
+```
+
+HMM :
+
+
+```{r}
+# Discretize numeric features into 4 levels
+discretize_data <- function(data, n_bins = 4) {
+  apply(data, 2, function(x) {
+    cut(x, breaks = n_bins,
+        labels = c("Low", "Medium", "High", "VeryHigh"),
+        include.lowest = TRUE)
+  })
+}
+
+# Apply to train/test data (excluding Class)
+disc_train <- discretize_data(trainData[, 1:9])
+disc_test  <- discretize_data(testData[, 1:9])
+
+# Create sequences (comma-separated string per sample)
+train_seq <- apply(disc_train, 1, paste, collapse = ",")
+test_seq  <- apply(disc_test,  1, paste, collapse = ",")
+train_labels <- trainData$Class
+test_labels  <- testData$Class
+
+```
+
+```{r}
+# HMM training helper
+train_hmm <- function(sequences, states = 3) {
+  obs <- unlist(strsplit(paste(sequences, collapse = ","), ","))
+  
+  model <- initHMM(
+    States = paste0("S", 1:states),
+    Symbols = c("Low", "Medium", "High", "VeryHigh"),
+    transProbs = matrix(1/states, states, states),
+    emissionProbs = matrix(1/4, states, 4)
+  )
+  
+  trained <- baumWelch(model, obs, maxIterations = 100)$hmm
+  return(trained)
+}
+
+# Train HMMs separately
+hmm_benign <- train_hmm(train_seq[train_labels == "benign"])
+hmm_malignant <- train_hmm(train_seq[train_labels == "malignant"])
+
+```
+
+```{r}
+# Stable logsumexp
+logsumexp <- function(x) {
+  m <- max(x)
+  m + log(sum(exp(x - m)))
+}
+
+# Predict probabilities using log-likelihood ratio
+get_hmm_probs <- function(sequences, hmm1, hmm2) {
+  sapply(sequences, function(seq) {
+    obs <- unlist(strsplit(seq, ","))
+    if (length(obs) == 0) return(NA)
+    
+    log_alpha1 <- forward(hmm1, obs)
+    log_alpha2 <- forward(hmm2, obs)
+    
+    logLik1 <- logsumexp(log_alpha1[, length(obs)])
+    logLik2 <- logsumexp(log_alpha2[, length(obs)])
+    
+    prob <- 1 / (1 + exp(-(logLik2 - logLik1)))  # malignant vs benign
+    return(prob)
+  })
+}
+
+# Predict on test set
+hmm_probs <- get_hmm_probs(test_seq, hmm_benign, hmm_malignant)
+
+# ROC and confusion matrix
+valid_preds <- !is.na(hmm_probs)
+roc_hmm <- roc(test_labels[valid_preds], hmm_probs[valid_preds], levels = c("benign", "malignant"), direction = "<")
+
+threshold <- coords(roc_hmm, "best", ret = "threshold")$threshold
+hmm_pred <- factor(ifelse(hmm_probs > threshold, "malignant", "benign"), levels = c("benign", "malignant"))
+
+cm_hmm <- confusionMatrix(hmm_pred[valid_preds], test_labels[valid_preds], positive = "malignant")
+
+```
+
+HMM with parameter tuning:
+
+```{r}
+library(depmixS4)
+library(pROC)
+library(dplyr)
+
+# Function to discretize numeric features into n_bins levels
+discretize_data <- function(data, n_bins = 4) {
+  labels <- c("Low", "Medium", "High", "VeryHigh")[1:n_bins]
+  apply(data, 2, function(x) {
+    cut(x, breaks = n_bins, labels = labels, include.lowest = TRUE)
+  })
+}
+
+# HMM training helper function
+train_hmm <- function(sequences, states = 3, n_bins = 4) {
+  obs <- unlist(strsplit(paste(sequences, collapse = ","), ","))
+  model <- initHMM(
+    States = paste0("S", 1:states),
+    Symbols = c("Low", "Medium", "High", "VeryHigh")[1:n_bins],
+    transProbs = matrix(1/states, states, states),
+    emissionProbs = matrix(1/n_bins, states, n_bins)
+  )
+  trained <- baumWelch(model, obs, maxIterations = 100)$hmm
+  return(trained)
+}
+
+# LogSumExp function for numerical stability
+logsumexp <- function(x) {
+  m <- max(x)
+  m + log(sum(exp(x - m)))
+}
+
+# Function to compute posterior probability using trained HMMs
+get_hmm_probs <- function(sequences, hmm1, hmm2) {
+  sapply(sequences, function(seq) {
+    obs <- unlist(strsplit(seq, ","))
+    if (length(obs) == 0) return(NA)
+    
+    log_alpha1 <- forward(hmm1, obs)
+    log_alpha2 <- forward(hmm2, obs)
+    
+    logLik1 <- logsumexp(log_alpha1[, length(obs)])
+    logLik2 <- logsumexp(log_alpha2[, length(obs)])
+    
+    prob <- 1 / (1 + exp(-(logLik2 - logLik1)))  # malignant vs benign probability
+    return(prob)
+  })
+}
+
+# Grid search parameters
+states_list <- 2:5
+bins_list <- 2:4
+
+best_auc <- -Inf
+best_results <- list()
+
+for (states in states_list) {
+  for (n_bins in bins_list) {
+    # Discretize train and test data with current bins
+    disc_train <- discretize_data(trainData[, 1:9], n_bins = n_bins)
+    disc_test  <- discretize_data(testData[, 1:9], n_bins = n_bins)
+    
+    # Create sequences
+    train_seq <- apply(disc_train, 1, paste, collapse = ",")
+    test_seq  <- apply(disc_test, 1, paste, collapse = ",")
+    
+    # Train HMMs for benign and malignant separately
+    hmm_benign <- train_hmm(train_seq[trainData$Class == "benign"], states = states, n_bins = n_bins)
+    hmm_malignant <- train_hmm(train_seq[trainData$Class == "malignant"], states = states, n_bins = n_bins)
+    
+    # Get probabilities on test sequences
+    hmm_probs <- get_hmm_probs(test_seq, hmm_benign, hmm_malignant)
+    
+    # Calculate ROC and AUC only for valid predictions
+    valid <- !is.na(hmm_probs)
+    roc_obj <- roc(testData$Class[valid], hmm_probs[valid], levels = c("benign", "malignant"), direction = "<")
+    auc_val <- roc_obj$auc
+    
+    # Update best model if AUC improves
+    if (auc_val > best_auc) {
+      best_auc <- auc_val
+      best_results <- list(
+        states = states,
+        n_bins = n_bins,
+        hmm_benign = hmm_benign,
+        hmm_malignant = hmm_malignant,
+        hmm_probs = hmm_probs,
+        roc = roc_obj,
+        test_seq = test_seq
+      )
+    }
+  }
+}
+
+# Final prediction using best HMM parameters
+optimal_threshold <- coords(best_results$roc, "best", ret = "threshold")$threshold
+best_pred <- factor(ifelse(best_results$hmm_probs > optimal_threshold, "malignant", "benign"),
+                    levels = c("benign", "malignant"))
+
+valid_preds <- !is.na(best_pred)
+
+cm_best <- confusionMatrix(best_pred[valid_preds], testData$Class[valid_preds], positive = "malignant")
+
+# Print best parameters and evaluation
+cat("Best HMM parameters:\n")
+cat("States:", best_results$states, "\n")
+cat("Bins:", best_results$n_bins, "\n\n")
+
+cat("Performance on test set:\n")
+print(cm_best)
+cat("AUC:", round(best_auc, 3), "\n")
+
+```
+
+
+```{r}
+
+results <- bind_rows(results, tibble(
+  Model = "HMM_BreastCancer",
+  Accuracy = round(cm_hmm$overall["Accuracy"], 3),
+  Sensitivity = round(cm_hmm$byClass["Sensitivity"], 3),
+  Specificity = round(cm_hmm$byClass["Specificity"], 3),
+  F1_Score = round(2 * (cm_hmm$byClass["Pos Pred Value"] * cm_hmm$byClass["Sensitivity"]) /
+                     (cm_hmm$byClass["Pos Pred Value"] + cm_hmm$byClass["Sensitivity"]), 3),
+  AUC = round(auc(roc_hmm), 3)
+))
+
+
+```
+
+```{r}
+# Print sorted results
+cat("\n ==== Classification Results ==== \n")
+results %>% arrange(desc(Accuracy)) %>% print()
+```
+
+```{r}
+roc_classifiers <- map(models, ~ roc(
+  response = testData$Class,
+  predictor = predict(.x, testData, type = "prob")[, "malignant"],
+  levels = c("benign", "malignant")
+))
+names(roc_classifiers) <- names(models)
+
+# --- 2. Generate ROC for XGBoost ---
+roc_xgb <- roc(
+  response = testData$Class,
+  predictor = predict(xgb_final, as.matrix(testData[, -ncol(testData)])),
+  levels = c("benign", "malignant")
+)
+
+# --- 3. Generate ROC for HMM (best tuned model) ---
+roc_hmm <- roc(
+  response = testData$Class[valid_preds],
+  predictor = best_results$hmm_probs[valid_preds],
+  levels = c("benign", "malignant")
+)
+
+# --- 4. Combine all ROC curves ---
+roc_list <- c(
+  roc_classifiers,
+  list(
+    "XGBoost" = roc_xgb,
+    "HMM_BreastCancer" = roc_hmm
+  )
+)
+
+# --- 5. Prepare data for ggplot ---
+roc_data <- bind_rows(lapply(names(roc_list), function(model) {
+  r <- roc_list[[model]]
+  data.frame(
+    FPR = 1 - r$specificities,
+    Sensitivity = r$sensitivities,
+    Model = model,
+    stringsAsFactors = FALSE
+  )
+}))
+
+# --- 6. Plot ROC curves ---
+ggplot(roc_data, aes(x = FPR, y = Sensitivity, color = Model)) +
+  geom_line(size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "ROC Curves for All Models (Including HMM)",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        legend.text = element_text(size = 8),
+        plot.title = element_text(hjust = 0.5)) +
+  guides(color = guide_legend(nrow = 3, byrow = TRUE))
+
+```
+
+

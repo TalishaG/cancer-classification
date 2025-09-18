@@ -1,0 +1,537 @@
+---
+title: "GSE14520"
+author: "2441010 Talisha Govender"
+date: "2025-09-16"
+output: html_document
+---
+
+```{r}
+library(GEOquery)
+library(caret)
+library(pROC)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(glmnet)
+library(tidyverse)
+library(ggplot2)
+library(pls)
+library(HMM)
+library(entropy)
+library(randomForest)
+library(class)      # knn
+library(e1071)      # svm
+library(xgboost)
+library(arm)      
+library(depmixS4)
+```
+
+```{r}
+options(timeout = 600)
+gse_set <- getGEO("GSE14520", GSEMatrix = TRUE)
+
+```
+
+```{r}
+gse <- gse_set[["GSE14520-GPL3921_series_matrix.txt.gz"]]
+
+```
+
+```{r}
+expr <- exprs(gse)               # genes x samples
+pheno <- pData(gse)
+
+
+# build label factor (ensure exact levels)
+if (!("characteristics_ch1" %in% colnames(pheno))) stop("characteristics_ch1 not found; inspect pData(gse)")
+labels <- factor(ifelse(grepl("^Tissue: Liver Tumor Tissue$", pheno$characteristics_ch1, ignore.case = TRUE),
+                        "Tumor", "Normal"), levels = c("Normal", "Tumor"))
+
+# Transpose so rows = samples, cols = genes
+expr_df <- as.data.frame(t(expr))
+expr_df$Class <- labels
+
+# Final predictors and response
+X_all <- as.matrix(expr_df[, -ncol(expr_df)])  # DO NOT scale  These are the predictors (all gene expression values)                        
+y_all <- expr_df$Class    # response (labels)
+
+cat("Data dims (samples x genes):", dim(X_all)[1], "x", dim(X_all)[2], "\n")
+table(y_all)
+```
+
+
+```{r}
+# Bhattacharyya score
+set.seed(123)
+bhatta_score <- function(x, y) {
+  lv <- levels(y)
+  x1 <- x[y == lv[1]]; x2 <- x[y == lv[2]]
+  m1 <- mean(x1, na.rm = TRUE); m2 <- mean(x2, na.rm = TRUE)
+  v1 <- var(x1, na.rm = TRUE); v2 <- var(x2, na.rm = TRUE)
+  0.25 * log(0.25 * (v1 / v2 + v2 / v1 + 2)) + 0.25 * ((m1 - m2)^2) / (v1 + v2)
+}
+
+rank_features <- function(MF, y) {
+  sc <- vapply(seq_len(ncol(MF)), function(j) bhatta_score(MF[, j], y), numeric(1))
+  ord <- order(sc, decreasing = TRUE)
+  tibble(feature = colnames(MF)[ord], score = sc[ord])
+}
+
+compute_meta <- function(data, clusters, use_pc1 = TRUE) {
+  cluster_ids <- unique(clusters)
+  meta_features <- matrix(nrow = nrow(data), ncol = length(cluster_ids))
+  colnames(meta_features) <- paste0("Cluster", cluster_ids)
+  
+  for (clust in cluster_ids) {
+    genes_in_cluster <- names(clusters)[clusters == clust]
+    cluster_data <- data[, genes_in_cluster, drop = FALSE]
+    
+    if (use_pc1) {
+      pca_cluster <- prcomp(cluster_data, center = TRUE, scale. = TRUE)
+      meta_features[, paste0("Cluster", clust)] <- pca_cluster$x[, 1]
+    } else {
+      meta_features[, paste0("Cluster", clust)] <- rowMeans(cluster_data, na.rm = TRUE)
+    }
+  }
+  as.data.frame(meta_features)
+}
+
+meta_features_all <- function(X_all,
+                             top_var = 10000,
+                             pcs_for_kmeans = 50,
+                             K = 100,
+                             seed = 123) {
+  set.seed(seed)
+  v <- apply(X_all, 2, var, na.rm = TRUE)
+  keep_genes <- names(sort(v, decreasing = TRUE))[seq_len(min(top_var, length(v)))]
+  X_all_f <- X_all[, keep_genes, drop = FALSE]
+
+  gpca <- prcomp(t(X_all_f), center = TRUE, scale. = TRUE)
+  use_pcs <- seq_len(min(pcs_for_kmeans, ncol(gpca$x)))
+  Gscores <- gpca$x[, use_pcs, drop = FALSE]
+
+  print(fviz_eig(gpca, addlabels = TRUE, ylim = c(0, 90), 
+         main = "Scree Plot: Variance Explained by Gene PCs",
+         xlab = "Principal Components", ylab = "Percentage of Explained Variance") +
+          theme_minimal())
+
+  K <- min(K, nrow(Gscores))
+  km <- kmeans(Gscores, centers = K, iter.max = 20, nstart = 10)
+  gene2clust <- km$cluster
+  names(gene2clust) <- rownames(Gscores)
+
+  MF_all <- compute_meta(X_all_f, gene2clust, use_pc1 = TRUE)
+  list(all = MF_all, gene_clusters = gene2clust, kept_genes = keep_genes)
+}
+
+MF <- meta_features_all(X_all, top_var = 10000, pcs_for_kmeans = 50, K = 100, seed = 2000)
+ranks <- rank_features(MF$all, y_all)
+selected <- head(ranks$feature, n = min(6, ncol(MF$all)))
+print(selected)
+E_all <- as.data.frame(MF$all[, selected, drop = FALSE])
+E_all_df <- data.frame(Class = y_all, E_all, check.names = FALSE)
+
+
+make_inner_trctrl <- function(seed = 123) {
+  set.seed(seed)
+  trainControl(method = "cv", number = 5, classProbs = TRUE,
+               summaryFunction = twoClassSummary, savePredictions = "final",
+               allowParallel = TRUE)
+}
+
+fit_glmnet <- function(X, y, trctrl) {
+  if (ncol(X) < 2) {
+    dat <- data.frame(Class = y, X)
+    fit <- tryCatch(arm::bayesglm(Class ~ ., data = dat, family = binomial()), error = function(e) glm(Class ~ ., data = dat, family = binomial()))
+    return(list(.engine = "glm_fallback", fit = fit, levels = levels(y)))
+  } else {
+    caret::train(x = X, y = y, method = "glmnet", metric = "ROC", trControl = trctrl, tuneLength = 8)
+  }
+}
+
+```
+
+```{r}
+
+get_prob <- function(model_obj, newdata, pos_class = "Tumor") {
+  if (is.list(model_obj) && identical(model_obj$.engine, "glm_fallback")) {
+    pr <- predict(model_obj$fit, newdata = newdata, type = "response")
+    return(as.numeric(pr))
+  } else if (inherits(model_obj, "train")) {
+    p <- predict(model_obj, newdata = newdata, type = "prob")
+    if (!(pos_class %in% colnames(p))) stop("Positive class not found in predict probability columns.")
+    return(as.numeric(p[, pos_class]))
+  } else {
+    stop("Unknown model object type in get_prob.")
+  }
+}
+
+discretize_data <- function(data, n_bins = 4) {
+  labels <- c("Low", "Medium", "High", "VeryHigh")[1:n_bins]
+  apply(data, 2, function(x) cut(x, breaks = n_bins, labels = labels, include.lowest = TRUE))
+}
+
+train_hmm <- function(sequences, states = 3, n_bins = 4) {
+  obs <- unlist(strsplit(paste(sequences, collapse = ","), ","))
+  if (length(obs) == 0) stop("No observations for HMM training")
+  all_symbols <- c("Low", "Medium", "High", "VeryHigh")[1:n_bins]
+  model <- initHMM(States = paste0("S", 1:states), Symbols = all_symbols,
+                   transProbs = matrix(1/states, states, states),
+                   emissionProbs = matrix(1/length(all_symbols), states, length(all_symbols)))
+  baumWelch(model, obs, maxIterations = 100)$hmm
+}
+
+logsumexp <- function(x) {
+  if (all(is.infinite(x))) return(-Inf)
+  m <- max(x)
+  m + log(sum(exp(x - m)))
+}
+
+get_hmm_probs <- function(sequences, tumor_hmm, normal_hmm, prior_ratio = 0) {
+  sapply(sequences, function(seq) {
+    obs <- unlist(strsplit(seq, ","))
+    if (length(obs) == 0) return(NA)
+    log_alpha_tumor <- forward(tumor_hmm, obs)
+    log_alpha_normal <- forward(normal_hmm, obs)
+    logLik_tumor <- logsumexp(log_alpha_tumor[, length(obs)])
+    logLik_normal <- logsumexp(log_alpha_normal[, length(obs)])
+    log_ratio <- logLik_tumor - logLik_normal
+    1 / (1 + exp(-log_ratio))
+  })
+}
+
+```
+
+```{r}
+library(pls)
+library(dplyr)
+library(caret)
+library(pROC)
+
+tune_hmm <- function(train_df, test_df, selected_features, prior_ratio = 0,
+                     states_list = 2:10, bins_list = 2:10) {
+
+  best_auc <- -Inf
+  best_probs <- NULL
+  best_tumor_hmm <- NULL
+  best_normal_hmm <- NULL
+
+  for (states in states_list) {
+    for (n_bins in bins_list) {
+      train_disc <- discretize_data(train_df[, selected_features, drop = FALSE], n_bins)
+      train_seq <- apply(train_disc, 1, paste, collapse = ",")
+      test_disc <- discretize_data(test_df[, selected_features, drop = FALSE], n_bins)
+      test_seq <- apply(test_disc, 1, paste, collapse = ",")
+
+      tumor_hmm <- tryCatch(train_hmm(train_seq[train_df$Class == "Tumor"], states, n_bins), error = function(e) NULL)
+      normal_hmm <- tryCatch(train_hmm(train_seq[train_df$Class == "Normal"], states, n_bins), error = function(e) NULL)
+      if (is.null(tumor_hmm) || is.null(normal_hmm)) next
+
+      hmm_probs <- tryCatch(get_hmm_probs(test_seq, tumor_hmm, normal_hmm, prior_ratio),
+                            error = function(e) rep(NA, length(test_seq)))
+      auc_val <- tryCatch(as.numeric(pROC::roc(response = test_df$Class, predictor = hmm_probs,
+                                               levels = c("Normal", "Tumor"), quiet = TRUE)$auc),
+                          error = function(e) -Inf)
+      if (auc_val > best_auc) {
+        best_auc <- auc_val
+        best_probs <- hmm_probs
+        best_tumor_hmm <- tumor_hmm
+        best_normal_hmm <- normal_hmm
+      }
+    }
+  }
+  list(probs = best_probs, tumor = best_tumor_hmm, normal = best_normal_hmm, auc = best_auc)
+}
+
+# Define %||% operator for safe defaults
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# 5-fold CV setup
+outer_folds <- 5
+set.seed(123)
+folds <- createFolds(y_all, k = outer_folds, list = TRUE, returnTrain = FALSE)
+fold_results <- list()
+
+best_hmms <- list()  # store best HMMs per feature set
+
+for (i in seq_along(folds)) {
+  cat("Running outer fold:", i, "\n")
+  
+  test_idx <- folds[[i]]
+  train_idx <- setdiff(seq_len(nrow(X_all)), test_idx)
+  
+  Xtr_full <- X_all[train_idx, , drop = FALSE]
+  Xte_full <- X_all[test_idx, , drop = FALSE]
+  ytr <- factor(droplevels(y_all[train_idx]), levels = c("Tumor", "Normal"))
+  yte <- factor(droplevels(y_all[test_idx]), levels = c("Tumor", "Normal"))
+  
+  # Precomputed PKPB + meta-feature sets
+  Etr_df <- E_all_df[train_idx, ]
+  Ete_df <- E_all_df[test_idx, ]
+  
+  # PLS using PKPB meta-features
+  pls_model <- plsr(as.numeric(ytr) - 1 ~ ., data = Etr_df[, -1, drop = FALSE], ncomp = 6, validation = "CV")
+  pls_loadings <- abs(loadings(pls_model))
+  pls_top_features <- colnames(Etr_df)[-1][order(rowSums(pls_loadings), decreasing = TRUE)[1:min(6, ncol(Etr_df)-1)]]
+  
+  # --- Feature sets ---
+  feature_sets <- list(
+    Entropy = list(train = Etr_df, test = Ete_df, selected = selected),
+    PLS = list(
+      train = data.frame(Etr_df[, pls_top_features, drop = FALSE], Class = ytr),
+      test  = data.frame(Ete_df[, pls_top_features, drop = FALSE], Class = yte),
+      selected = pls_top_features
+    )
+  )
+  
+  # Inner CV control
+  inner_trctrl <- make_inner_trctrl(seed = 2000 + i)
+  
+  # Storage for fold probabilities
+  probs_list <- list()
+  
+  for (fs_name in names(feature_sets)) {
+    fs <- feature_sets[[fs_name]]
+    selected_features <- fs$selected %||% colnames(fs$train)[colnames(fs$train) != "Class"]
+    
+    # --- Train caret models ---
+    X_train <- as.matrix(fs$train[, selected_features, drop = FALSE])
+    X_test <- as.matrix(fs$test[, selected_features, drop = FALSE])
+    y_train <- fs$train$Class
+    
+    models <- list()
+    models$logistic <- fit_glmnet(X_train, y_train, inner_trctrl)
+    models$rf <- caret::train(x = X_train, y = y_train, method = "rf", metric = "ROC", trControl = inner_trctrl, tuneLength = 5, ntree = 500)
+    models$knn <- caret::train(x = X_train, y = y_train, method = "knn", metric = "ROC", trControl = inner_trctrl, tuneLength = 5)
+    models$svm <- caret::train(x = X_train, y = y_train, method = "svmRadial", metric = "ROC", trControl = inner_trctrl, tuneLength = 5)
+    models$xgb <- caret::train(x = X_train, y = y_train, method = "xgbTree", metric = "ROC", trControl = inner_trctrl, tuneLength = 5,
+                               tuneGrid = expand.grid(nrounds = 100, max_depth = 3, eta = 0.1,
+                                                      gamma = 0, colsample_bytree = 0.8,
+                                                      min_child_weight = 1, subsample = 0.8))
+    models$bayesglm <- caret::train(x = X_train, y = y_train, method = "bayesglm", metric = "ROC", trControl = inner_trctrl)
+    
+    # --- Predict caret models ---
+    for (nm in names(models)) {
+      probs_list[[paste(fs_name, nm, sep = "_")]] <- get_prob(models[[nm]], as.data.frame(X_test))
+    }
+    
+    # --- HMM ---
+    n_tumor <- sum(y_train == "Tumor")
+    n_normal <- sum(y_train == "Normal")
+    prior_ratio <- log(n_tumor / n_normal)
+    hmm_res <- tune_hmm(train_df = fs$train, test_df = fs$test, selected_features = selected_features,
+                        prior_ratio = prior_ratio, states_list = 2:4, bins_list = 3:6)
+    
+    # Save HMM objects along with probs
+    probs_list[[paste(fs_name, "HMM", sep = "_")]] <- hmm_res$probs
+    if (is.null(best_hmms[[fs_name]])) best_hmms[[fs_name]] <- list()
+    # Store tumor & normal HMMs of this fold
+    best_hmms[[fs_name]]$tumor <- hmm_res$tumor
+    best_hmms[[fs_name]]$normal <- hmm_res$normal
+  }
+  
+  # Evaluate fold metrics
+  models_metrics <- tibble()
+  for (mname in names(probs_list)) {
+    pr <- probs_list[[mname]]
+    if (all(is.na(pr))) {
+      row <- tibble(model = mname, AUC = NA_real_, Accuracy = NA_real_, Sensitivity = NA_real_,
+                    Specificity = NA_real_, F1 = NA_real_, FN = NA_real_)
+    } else {
+      pred_class <- factor(ifelse(pr >= 0.5, "Tumor", "Normal"), levels = levels(yte))
+      auc_val <- tryCatch(as.numeric(pROC::roc(response = yte, predictor = pr, quiet = TRUE)$auc),
+                          error = function(e) NA_real_)
+      cm <- tryCatch(confusionMatrix(pred_class, yte, positive = "Tumor"), error = function(e) NULL)
+      if (is.null(cm)) {
+        row <- tibble(model = mname, AUC = auc_val, Accuracy = NA_real_, Sensitivity = NA_real_,
+                      Specificity = NA_real_, F1 = NA_real_, FN = NA_real_)
+      } else {
+        row <- tibble(model = mname, Accuracy = cm$overall["Accuracy"], AUC = auc_val,
+                      Sensitivity = cm$byClass["Sensitivity"], Specificity = cm$byClass["Specificity"],
+                      F1 = cm$byClass["F1"], FN = cm$table["Normal", "Tumor"])
+      }
+    }
+    models_metrics <- bind_rows(models_metrics, row)
+  }
+  fold_results[[i]] <- models_metrics %>% mutate(fold = i)
+}
+
+# --- 2. Aggregate CV results with specified column order ---
+cv_results <- bind_rows(fold_results)
+cv_summary <- cv_results %>%
+  group_by(model) %>%
+  summarise(Accuracy = mean(Accuracy, na.rm = TRUE),
+            AUC = mean(AUC, na.rm = TRUE),
+            Sensitivity = mean(Sensitivity, na.rm = TRUE),
+            Specificity = mean(Specificity, na.rm = TRUE),
+            F1 = mean(F1, na.rm = TRUE),
+            FN = mean(FN, na.rm = TRUE)) %>%
+  arrange(desc(Accuracy), desc(Sensitivity), desc(AUC))
+
+cv_summary
+
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+library(cowplot)
+
+# Define safe default operator
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ---- Dynamic Emission Plot ----
+plot_emissions_clean <- function(hmm, title = "", fill_color = "#1f77b4") {
+  df <- as.data.frame(hmm$emissionProbs)
+  df$State <- rownames(df)
+  df_long <- melt(df, id.vars = "State", variable.name = "Symbol", value.name = "Probability")
+  
+  ggplot(df_long, aes(x = Symbol, y = State, fill = Probability)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Probability, 2)), size = 3) +
+    scale_fill_gradient(low = "white", high = fill_color) +
+    coord_fixed(ratio = 1) +  # keep tiles square
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.position = "right",
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 10)
+    ) +
+    labs(title = title, x = "Symbol", y = "Probability")
+}
+
+# ---- Dynamic Transition Plot ----
+plot_transitions_clean <- function(hmm, title = "", fill_color = "#1f77b4") {
+  df <- as.data.frame(hmm$transProbs)
+  df$From <- rownames(df)
+  df_long <- melt(df, id.vars = "From", variable.name = "To", value.name = "Probability")
+  
+  ggplot(df_long, aes(x = To, y = From, fill = Probability)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = round(Probability, 2)), size = 3) +
+    scale_fill_gradient(low = "white", high = fill_color) +
+    coord_fixed(ratio = 1) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "right",
+      legend.title = element_text(size = 11),
+      legend.text = element_text(size = 10)
+    ) +
+    labs(title = title, x = "To State", y = "From State")
+}
+
+# ---- Function to Save + Display Combined Plots ----
+save_hmm_plots <- function(plot_list, filename, ncol = 2, tile_scale = 1.2) {
+  combined <- cowplot::plot_grid(plotlist = plot_list, ncol = ncol, align = "hv")
+  print(combined)  # show in RStudio
+  ggsave(filename, plot = combined, width = 12, height = 8, dpi = 300)
+  return(combined)
+}
+
+# ---- Emission Plots ----
+emission_plots <- list(
+  plot_emissions_clean(best_hmms$Entropy$tumor, "Entropy - Tumor Emissions", "#ff7f0e"),
+  plot_emissions_clean(best_hmms$Entropy$normal, "Entropy - Normal Emissions", "#ff7f0e"),
+  plot_emissions_clean(best_hmms$PLS$tumor, "PLS - Tumor Emissions", "#1f77b4"),
+  plot_emissions_clean(best_hmms$PLS$normal, "PLS - Normal Emissions", "#1f77b4")
+)
+emission_combined <- save_hmm_plots(emission_plots, "GSE14520_emissions_plot.png", ncol = 2)
+
+# ---- Transition Plots ----
+transition_plots <- list(
+  plot_transitions_clean(best_hmms$Entropy$tumor, "Entropy - Tumor Transitions", "#ff7f0e"),
+  plot_transitions_clean(best_hmms$Entropy$normal, "Entropy - Normal Transitions", "#ff7f0e"),
+  plot_transitions_clean(best_hmms$PLS$tumor, "PLS - Tumor Transitions", "#1f77b4"),
+  plot_transitions_clean(best_hmms$PLS$normal, "PLS - Normal Transitions", "#1f77b4")
+)
+transition_combined <- save_hmm_plots(transition_plots, "GSE14520_transitions_plot.png", ncol = 2)
+
+
+```
+
+```{r}
+# Perform PCA on the final selected meta-feature set
+pca_result <- prcomp(E_all, center = TRUE, scale. = TRUE)
+
+# Create a dataframe for plotting
+plot_data <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  Class = y_all
+)
+
+# Calculate variance explained by each PC
+variance_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2) * 100
+
+# Create a cleaner, publication-ready biplot
+pca_plot <- ggplot(plot_data, aes(x = PC1, y = PC2, color = Class, shape = Class)) +
+  geom_point(alpha = 0.8, size = 4) +                      # slightly larger points
+  stat_ellipse(level = 0.8, linewidth = 0.7, linetype = 1, alpha = 0.3) + # semi-transparent ellipses
+  scale_color_manual(values = c("Normal" = "#2c7bb6", "Tumor" = "#d7191c")) +
+  labs(
+    title = "PCA of Selected Meta-Features",
+    x = paste0("PC1 (", round(variance_explained[1], 1), "%)"),
+    y = paste0("PC2 (", round(variance_explained[2], 1), "%)"),
+    color = "Class",
+    shape = "Class"
+  ) +
+  theme_minimal(base_size = 14) +                         # larger base font
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+# Print the plot
+print(pca_plot)
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Create 'selection' column and clean 'model' names
+cv_results_paired <- cv_results %>%
+  mutate(
+    selection = ifelse(grepl("^Entropy", model), "Entropy",
+                       ifelse(grepl("^PLS", model), "PLS", "Other")),
+    model_clean = gsub("^(Entropy|PLS)_", "", model)  # remove prefix for x-axis
+  )
+
+# Reshape for plotting
+cv_long <- cv_results_paired %>%
+  pivot_longer(
+    cols = c(AUC, Accuracy, Sensitivity, Specificity, F1, FN),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+# Boxplot
+ggplot(cv_long, aes(x = model_clean, y = Value, fill = selection)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = 21, alpha = 0.7) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_fill_manual(values = c("Entropy" = "#ff7f0e", "PLS" = "#1f77b4")) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+    title = "Performance Metrics: Entropy vs PLS Hybrid Methods (5-Fold CV)",
+    x = "Model",
+    y = "Metric Value",
+    fill = "Feature Set"
+  )
+
+
+```
